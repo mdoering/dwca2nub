@@ -3,15 +3,29 @@
   <property name="defaultPattern" value="%-5level [%date{'yyyy-MM-dd HH:mm:ss,SSSZ'}] [%thread] %logger: %msg%n%xEx"/>
 
   <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+    <filter class="ch.qos.logback.classic.filter.LevelFilter">
+      <level>INFO</level>
+      <onMatch>ACCEPT</onMatch>
+      <onMismatch>DENY</onMismatch>
+    </filter>
+    <encoder>
+      <pattern>${defaultPattern}</pattern>
+    </encoder>
+  </appender>
+
+  <appender name="FILE" class="ch.qos.logback.core.FileAppender">
+    <file>log.txt </file>
+    <append>true</append>
     <encoder>
       <pattern>${defaultPattern}</pattern>
     </encoder>
   </appender>
 
 
-  <logger name="org.gbif.giasip" level="DEBUG"/>
+  <logger name="org.gbif.giasip" level="INFO"/>
 
   <root level="INFO">
     <appender-ref ref="CONSOLE"/>
+    <appender-ref ref="FILE"/>
   </root>
 </configuration>

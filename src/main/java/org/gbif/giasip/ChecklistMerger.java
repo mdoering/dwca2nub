@@ -60,6 +60,8 @@ public class ChecklistMerger {
   private static final Term OCC_COUNT_TERM = TermFactory.instance().findTerm("http://rs.gbif.org/terms/1.0/occurrenceCount");
   private static final Term DISTRIBUTION_ROWTYPE = TermFactory.instance().findTerm("http://rs.gbif.org/issg/terms/Distribution");
   private static final Term INVASIVENESS_TERM = TermFactory.instance().findTerm("http://rs.gbif.org/issg/terms/invasiveness");
+  private static final String ESTABLISHMENT_MEANS_UNSPECIFIED = "http://rs.gbif.org/vocabulary/issg/status/Unspecified";
+  private static final String INVASIVENESS_UNSPECIFIED = "http://rs.gbif.org/vocabulary/issg/invasiveness/Unspecified";
 
   private final NameUsageMatchingService matchingService;
   private final LookupUsageMatchWsClient matchingClient;
@@ -112,15 +114,16 @@ public class ChecklistMerger {
     return new File(datasets, sourceCode+".xml");
   }
 
-  public void add(File dwca, String sourceCode) throws IOException {
+  public void add(URI dwca, String sourceCode) throws IOException {
     sourceCode = sourceCode.trim().replaceAll(" ", "-");
     if (datasetIDs.contains(sourceCode)) {
       throw new IllegalArgumentException("Source code already exists: "+sourceCode);
     }
 
+    // download dwca
     File tmpDir = FileUtils.createTempDir();
-    LOG.info("Opening source {} at {}", sourceCode, dwca.getAbsoluteFile());
-    Archive archive = ArchiveFactory.openArchive(dwca, tmpDir);
+    LOG.info("Opening source {} at {}", sourceCode, dwca);
+    Archive archive = ArchiveFactory.openArchive(dwca.toURL(), tmpDir);
 
     // add source EML as dataset constituent
     File eml = new File(tmpDir, archive.getMetadataLocation());
@@ -158,6 +161,8 @@ public class ChecklistMerger {
   }
 
   private void addCore(StarRecord star, DwcaRecord rec, String sourceCode) {
+    rec.core.put(DwcTerm.datasetID, sourceCode);
+
     String kingdom = star.core().value(DwcTerm.kingdom);
     String name = star.core().value(DwcTerm.scientificName);
     String author = star.core().value(DwcTerm.scientificNameAuthorship);
@@ -204,77 +209,59 @@ public class ChecklistMerger {
 
     // add to core using the most reliable of the 2 matches
     Integer taxonKey;
-    rec.core.put(DwcTerm.datasetID, sourceCode);
     if (lmatch.hasMatch() && (match.getUsageKey() == null || author != null)  ) {
-      taxonKey = lookup.getKey();
+      taxonKey = addBackboneTaxonomy(rec, lookup.getKey());
       LOG.debug("Add lookup {}:{}", taxonKey, spaceJoin.join(lookup.getCanonical(), lookup.getAuthorship()));
-      if (!taxa.containsKey(taxonKey)) {
-        addBackboneTaxonomy(rec, lmatch.getMatch());
-        taxa.put(taxonKey, rec);
-      }
 
     } else if (match.getUsageKey() != null) {
-      taxonKey = match.getUsageKey();
+      taxonKey = addBackboneTaxonomy(rec, match.getUsageKey());
       LOG.debug("Add match {}:{}", taxonKey, match.getScientificName());
-      if (!taxa.containsKey(taxonKey)) {
-        addBackboneTaxonomy(rec, match);
-        taxa.put(taxonKey, rec);
-      }
 
     } else {
-      taxonKey = -1 * unmatchedCounter++;
       LOG.warn("Could not match: {}", name);
-      addBackboneTaxonomy(rec, name, author);
+      taxonKey = addBackboneTaxonomy(rec, name, author);
+    }
+
+    if (!taxa.containsKey(taxonKey)) {
       taxa.put(taxonKey, rec);
     }
   }
 
-  private void addBackboneTaxonomy(DwcaRecord rec, String sciname, String authorship) {
+  private int addBackboneTaxonomy(DwcaRecord rec, String sciname, String authorship) {
     rec.core.put(DwcTerm.scientificName, sciname);
     rec.core.put(DwcTerm.scientificNameAuthorship, authorship);
+    return -1 * unmatchedCounter++;
   }
 
-  private void addBackboneTaxonomy(DwcaRecord rec, LookupUsage match) {
-    rec.core.put(DwcTerm.taxonID, String.valueOf(match.getKey()));
-    // get full usage
-    NameUsage usage = usageService.get(match.getKey(), null);
-    rec.core.put(DwcTerm.taxonomicStatus, usage.getTaxonomicStatus().name().toLowerCase());
-    rec.core.put(DwcTerm.scientificName, usage.getScientificName());
-    rec.core.put(DwcTerm.taxonRank, usage.getRank().name().toLowerCase());
-    rec.core.remove(DwcTerm.scientificNameAuthorship);
-
-    // copy classification
-    addClassification(rec, usage);
-
-    // add accepted name
-    if (usage.isSynonym()) {
-      rec.core.put(DwcTerm.acceptedNameUsage, usage.getAccepted());
-    }
-  }
-  private void addBackboneTaxonomy(DwcaRecord rec, NameUsageMatch match) {
-    rec.core.put(DwcTerm.taxonID, match.getUsageKey().toString());
-    // copy name & rank
-    rec.core.put(DwcTerm.scientificName, match.getScientificName());
-    rec.core.remove(DwcTerm.scientificNameAuthorship);
-    rec.core.put(DwcTerm.taxonRank, match.getRank().name().toLowerCase());
-    rec.core.put(DwcTerm.taxonomicStatus, match.getStatus().name().toLowerCase());
-
-    // copy classification
-    addClassification(rec, match);
-
+  /**
+   * Adds backbone infos to DwcaRecord using the accetped usage in case of synoynms.
+   * @return key of the accepted name usage
+   */
+  private int addBackboneTaxonomy(DwcaRecord rec, int usageKey) {
+    NameUsage u = usageService.get(usageKey, null);
     // get accepted name?
-    if (match.isSynonym()) {
-      LOG.debug("Retrieve accepted name for {} [{}]", match.getScientificName(), match.getUsageKey());
-      NameUsage synonym = usageService.get(match.getUsageKey(), null);
-      rec.core.put(DwcTerm.acceptedNameUsage, synonym.getAccepted());
+    if (u.isSynonym()) {
+      String synonym = u.getScientificName();
+      u = usageService.get(u.getAcceptedKey(), null);
+      LOG.debug("Retrieved accepted name {} [{}] for synonym {}", u.getScientificName(), u.getKey(), synonym);
     }
+
+    rec.core.put(DwcTerm.taxonID, String.valueOf(u.getKey()));
+    // copy name & rank
+    rec.core.put(DwcTerm.scientificName, u.getScientificName());
+    rec.core.remove(DwcTerm.scientificNameAuthorship);
+    rec.core.put(DwcTerm.taxonRank, u.getRank().name().toLowerCase());
+    rec.core.put(DwcTerm.taxonomicStatus, u.getTaxonomicStatus().name().toLowerCase());
+
+    // copy classification
+    for (Rank r : Rank.LINNEAN_RANKS) {
+      rec.setHigherRank(r, u.getHigherRank(r));
+    }
+
+    // return accepted taxon key
+    return u.getKey();
   }
 
-  private void addClassification(DwcaRecord rec, LinneanClassification cl) {
-    for (Rank r : Rank.LINNEAN_RANKS) {
-      rec.setHigherRank(r, cl.getHigherRank(r));
-    }
-  }
   private static DwcaRecord toRec(Record core) {
     DwcaRecord dr = new DwcaRecord();
     dr.core = toMap(core);
@@ -355,6 +342,8 @@ public class ChecklistMerger {
           row2[0] = key.toString();
           row2[1] = GBIF_CODE;
           row2[2] = row[1];
+          row2[3] = ESTABLISHMENT_MEANS_UNSPECIFIED;
+          row2[4] = INVASIVENESS_UNSPECIFIED;
           row2[5] = row[2];
           tw.write(row2);
         }
@@ -366,10 +355,10 @@ public class ChecklistMerger {
   }
 
   public static void main(String[] args) throws Exception {
-    ChecklistMerger merger = new ChecklistMerger(new URI("http://api.gbif-uat.org/v1/"), new File("/Users/markus/Desktop/giasip"));
+    ChecklistMerger merger = new ChecklistMerger(new URI("http://api.gbif.org/v1/"), new File("/Users/markus/Desktop/giasip"));
 
-    merger.add(new File("dwca-gisd.zip"), "GISD");
-    merger.add(new File("dwca-isc.zip"), "ISC");
+    merger.add(URI.create("http://giasip.gbif.org/archive.do?r=isc"), "ISC");
+    merger.add(URI.create("http://giasip.gbif.org/archive.do?r=gisd"), "GISD");
     merger.writeArchive();
     merger.addGbifOccurrences(new File("gbif-country.csv"));
     System.out.println("DONE!");
