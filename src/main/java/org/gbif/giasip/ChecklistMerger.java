@@ -17,6 +17,8 @@ import org.gbif.dwc.terms.Term;
 import org.gbif.dwc.terms.TermFactory;
 import org.gbif.dwca.io.Archive;
 import org.gbif.dwca.io.ArchiveFactory;
+import org.gbif.dwca.io.ArchiveField;
+import org.gbif.dwca.io.ArchiveFile;
 import org.gbif.dwca.io.DwcaWriter;
 import org.gbif.dwca.record.Record;
 import org.gbif.dwca.record.StarRecord;
@@ -60,8 +62,8 @@ public class ChecklistMerger {
   private static final Term OCC_COUNT_TERM = TermFactory.instance().findTerm("http://rs.gbif.org/terms/1.0/occurrenceCount");
   private static final Term DISTRIBUTION_ROWTYPE = TermFactory.instance().findTerm("http://rs.gbif.org/issg/terms/Distribution");
   private static final Term INVASIVENESS_TERM = TermFactory.instance().findTerm("http://rs.gbif.org/issg/terms/invasiveness");
-  private static final String ESTABLISHMENT_MEANS_UNSPECIFIED = "http://rs.gbif.org/vocabulary/issg/status/Unspecified";
-  private static final String INVASIVENESS_UNSPECIFIED = "http://rs.gbif.org/vocabulary/issg/invasiveness/Unspecified";
+  private static final String ESTABLISHMENT_MEANS_UNSPECIFIED = "Unspecified";
+  private static final String INVASIVENESS_UNSPECIFIED = "Unspecified";
 
   private final NameUsageMatchingService matchingService;
   private final LookupUsageMatchWsClient matchingClient;
@@ -78,6 +80,14 @@ public class ChecklistMerger {
   private int unmatchedCounter = 0;
   private File distributionFile;
   private int distributionCols;
+
+  public ChecklistMerger() {
+    this.matchingService = null;
+    this.matchingClient = null;
+    this.usageService = null;
+    this.dwcaDir = null;
+    this.datasets = null;
+  }
 
   public ChecklistMerger(URI api, File dwcaDir) {
     Properties props = new Properties();
@@ -138,8 +148,7 @@ public class ChecklistMerger {
     int counter = 0;
     final int unmatchedBefore = unmatchedCounter;
     for (StarRecord star : archive) {
-      DwcaRecord rec = toRec(star.core());
-      addCore(star, rec, sourceCode);
+      DwcaRecord rec = addCore(star, sourceCode);
       addExtensionData(star, rec, sourceCode);
       counter++;
     }
@@ -156,11 +165,8 @@ public class ChecklistMerger {
     }
   }
 
-  private static String nameKey(String name) {
-    return name.toUpperCase().trim().replaceAll("\\s+", "_");
-  }
-
-  private void addCore(StarRecord star, DwcaRecord rec, String sourceCode) {
+  private DwcaRecord addCore(StarRecord star, String sourceCode) {
+    DwcaRecord rec = toRec(star.core());
     rec.core.put(DwcTerm.datasetID, sourceCode);
 
     String kingdom = star.core().value(DwcTerm.kingdom);
@@ -224,7 +230,11 @@ public class ChecklistMerger {
 
     if (!taxa.containsKey(taxonKey)) {
       taxa.put(taxonKey, rec);
+    } else {
+      rec = taxa.get(taxonKey);
     }
+
+    return rec;
   }
 
   private int addBackboneTaxonomy(DwcaRecord rec, String sciname, String authorship) {
@@ -246,7 +256,7 @@ public class ChecklistMerger {
       LOG.debug("Retrieved accepted name {} [{}] for synonym {}", u.getScientificName(), u.getKey(), synonym);
     }
 
-    rec.core.put(DwcTerm.taxonID, String.valueOf(u.getKey()));
+    rec.core.put(DwcTerm.taxonConceptID, String.valueOf(u.getKey()));
     // copy name & rank
     rec.core.put(DwcTerm.scientificName, u.getScientificName());
     rec.core.remove(DwcTerm.scientificNameAuthorship);
@@ -328,7 +338,9 @@ public class ChecklistMerger {
   public void addGbifOccurrences(File occF) throws IOException {
     LOG.info("Add GBIF occurrences from {}", occF.getAbsolutePath());
 
-    CSVReader reader = new CSVReader(occF, "UTF8", "\t", null, 0);
+    int counterIncluded = 0;
+    int counterExcluded = 0;
+    CSVReader reader = new CSVReader(occF, "UTF8", ";", null, 0);
     try(FileWriter fw = new FileWriter(distributionFile, true)) {
       TabWriter tw = new TabWriter(fw);
       for (String[] row : reader) {
@@ -336,6 +348,7 @@ public class ChecklistMerger {
         Integer taxonKey = Integer.valueOf(row[0]);
         if (!taxonKey2ID.containsKey(taxonKey)) {
           LOG.warn("TaxonKey {} not present in archive, ignore", taxonKey);
+          counterExcluded++;
 
         } else {
           Integer key = taxonKey2ID.get(taxonKey);
@@ -346,21 +359,77 @@ public class ChecklistMerger {
           row2[4] = INVASIVENESS_UNSPECIFIED;
           row2[5] = row[2];
           tw.write(row2);
+          counterIncluded++;
         }
       }
       tw.close();
     }
-    LOG.info("Added {} GBIF occurrences", reader.getReadRows());
+    LOG.info("Added {} GBIF occurrences, {} excluded", counterIncluded, counterExcluded);
     reader.close();
   }
 
-  public static void main(String[] args) throws Exception {
-    ChecklistMerger merger = new ChecklistMerger(new URI("http://api.gbif.org/v1/"), new File("/Users/markus/Desktop/giasip"));
+  /**
+   * Replaces GBIF occurrences in an existing archive
+   */
+  public void replaceGbifOccurrences(Archive a, File occF) throws IOException {
 
-    merger.add(URI.create("http://giasip.gbif.org/archive.do?r=isc"), "ISC");
-    merger.add(URI.create("http://giasip.gbif.org/archive.do?r=gisd"), "GISD");
-    merger.writeArchive();
-    merger.addGbifOccurrences(new File("gbif-country.csv"));
+    ArchiveFile af = a.getExtension(DISTRIBUTION_ROWTYPE);
+    distributionFile = af.getLocationFile();
+    List<ArchiveField> fields = af.getFieldsSorted();
+    distributionCols = fields.get(fields.size()-1).getIndex()+1;
+
+    // copy existing file to a tmp one to read so we can rewrite the old one
+    File oldDistributionFile = new File(dwcaDir, "oldDistFile.txt");
+    org.apache.commons.io.FileUtils.copyFile(distributionFile, oldDistributionFile);
+    distributionFile.delete();
+
+    // mappings should be fixed
+    // 0=id
+    // 1=datasetID
+    // 2=country code
+    // 3=establishment means
+    // 4=invasiveness
+    // 5=occ count
+    LOG.info("Removing existing GBIF occurrences");
+    CSVReader reader = new CSVReader(oldDistributionFile, "UTF8", "\t", null, 0);
+    int delCounter = 0;
+    try(FileWriter fw = new FileWriter(distributionFile, false)) {
+      TabWriter tw = new TabWriter(fw);
+      for (String[] row : reader) {
+        // ignore GBIF records
+        if (!GBIF_CODE.equalsIgnoreCase(row[1])) {
+          tw.write(row);
+        } else {
+          delCounter++;
+        }
+      }
+      tw.close();
+    }
+    LOG.info("Removed {} GBIF occurrences", delCounter);
+
+
+    LOG.info("Build id map for existing archive");
+    taxonKey2ID.clear();
+    for (StarRecord star : a) {
+      if (!Strings.isNullOrEmpty(star.core().value(DwcTerm.taxonID))) {
+        taxonKey2ID.put(Integer.valueOf(star.core().value(DwcTerm.taxonID)), Integer.valueOf(star.core().id()));
+      }
+    }
+
+    addGbifOccurrences(occF);
+  }
+
+  public static void main(String[] args) throws Exception {
+
+    ChecklistMerger merger = new ChecklistMerger();
+    Archive a = ArchiveFactory.openArchive(new File("/Users/markus/Desktop/giasip"));
+    merger.replaceGbifOccurrences(a, new File("gbif-country.csv"));
+
+    //ChecklistMerger merger = new ChecklistMerger(new URI("http://api.gbif.org/v1/"), new File("/Users/markus/Desktop/giasip"));
+    //merger.add(URI.create("http://giasip.gbif.org/archive.do?r=isc"), "ISC");
+    //merger.add(URI.create("http://giasip.gbif.org/archive.do?r=gisd"), "GISD");
+    //merger.writeArchive();
+    //merger.addGbifOccurrences(new File("gbif-country.csv"));
     System.out.println("DONE!");
   }
 }
